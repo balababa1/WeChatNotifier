@@ -1,0 +1,22 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build logs
+build_log.txt
+
+# Runtime data (contains logs, PID files, personal JSON configs)
+data/*
+!data/wechat_new.ico
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
