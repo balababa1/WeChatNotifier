@@ -21,3 +21,4 @@ data/*
 .idea/
 *.swp
 *.swo
+!WeChatNotifier_v0.2.5_nolog.spec
