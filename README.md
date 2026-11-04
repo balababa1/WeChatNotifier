@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-lightgrey.svg)]()
+[![Version](https://img.shields.io/badge/Version-v0.2.7-22d3ee.svg)]()
 
 ## 这是什么？
 
@@ -12,52 +13,94 @@
 
 **微信不用置顶，最小化到任务栏即可正常工作。**
 
-**如果开启讲述人重启微信依旧不可用则无法使用**  
-**经测试微信是否走MMUI框架为绑定账号的灰度测试**  
-**作者自己的微信可在朋友电脑上登录使用 但朋友的微信经过无数尝试皆不可用**  
+**如果开启讲述人重启微信依旧不可用则无法使用**
+**经测试微信是否走MMUI框架为绑定账号的灰度测试**
+**作者自己的微信可在朋友电脑上登录使用 但朋友的微信经过无数尝试皆不可用**
 
----  
+---
 
-## 测试效果  
+## 测试效果
 <img width="415" height="166" alt="微信图片_2026-08-01_125945_170" src="https://github.com/user-attachments/assets/c6d28c9a-3fd7-4784-955c-bc355155047c" />
 <img width="427" height="196" alt="微信图片_2026-08-01_125940_505" src="https://github.com/user-attachments/assets/79a8114d-0056-4ffe-9461-fa49edbacb2b" />
 <img width="466" height="278" alt="微信图片_2026-08-01_125958_892" src="https://github.com/user-attachments/assets/eb46376d-53f1-45db-b28f-52c3a0b5b03b" />
 
+---
 
 ## 功能特性
 
 | 特性 | 说明 |
 |------|------|
-| Toast 弹窗 | 基于 tkinter 自绘的半透明圆角通知卡片，显示联系人 + 未读数 + 消息预览 |
+| Toast 弹窗 | PIL 超采样渲染 + Win32 分层窗口，半透明圆角卡片，显示联系人 + 未读数 + 消息预览 |
+| 红包提醒（v0.2.7 新增） | 独立红包样式弹窗（金色封口条 + 「開」钮）并播放提示音，不受未读数、免打扰、时间窗限制 |
+| 免打扰群聊（v0.2.7 新增） | 普通消息在免打扰会话中静默，红包照常提醒；会话名自动剔除「消息免打扰」标签 |
+| 文件事件唤醒（v0.2.7） | 监听微信 db_storage 的 session / message 目录变化触发扫描，替代 0.1 秒空转轮询 |
+| Emoji 混排 | 按 emoji / 文字分段度量绘制，Segoe UI Emoji 与雅黑混排，超宽自动省略 |
 | 点击跳转 | 点击弹窗自动激活微信窗口（模拟快捷键） |
 | 零依赖微信 API | 不调用微信任何官方接口，不注入微信进程，纯 UIA 树读取 |
-| 后台常驻 | `--background` 模式最小化 CMD 窗口后隐形运行，托盘无图标（极简设计） |
+| 后台常驻 | `--background` 模式彻底脱离控制台运行，托盘无图标（极简设计） |
 | 快捷键唤醒 | 支持 Alt+X / Ctrl+Alt+W / Alt+W 三种预设，可关闭 |
 | 开机自启 | VBS + 计划任务实现，登录时无 CMD 窗口闪现 |
-| COM 容灾 | 自动检测 COM/RPC 断连，触发 CoInitialize 重置恢复 |
-| 黑名单过滤 | 自动忽略服务号、公众号、文件传输助手、微信团队等系统账号 |
-| 日志去重 | 重复消息智能压制（COM/UIA 错误消息例外，确保调试透明） |
+| COM 容灾 | 异常检测后非阻塞退避 30 秒重置 CoInitialize，界面不卡死 |
+| 黑名单过滤 | 自动忽略服务号、公众号、文件传输助手、折叠的聊天、服务通知、微信团队等系统账号 |
+| 异常可见化 | 异常统一写入 `data/error.log`（含 traceback，512KB 轮转），不再静默吞错 |
+| 诊断日志分层 | `DEBUG_LOG = False`，正式版诊断日志零落盘，debug.log 仅保留弹窗记录 |
+
+---
+
+## 红包提醒与免打扰规则
+
+红包通道与普通消息通道**完全解耦**，判定依据是会话列表消息中的类型标签 `[微信红包]`：
+
+- 私聊：`[微信红包] 恭喜发财，大吉大利`
+- 群聊：`发送者昵称: [微信红包] ...`
+- 领取提示（如「XX领取了你的红包」）不含该标签，不会误弹
+
+| 场景 | 普通消息 | 红包 |
+|------|----------|------|
+| 免打扰群聊 | 静默，不弹窗 | **照常弹红包窗 + 提示音** |
+| 未读数为 1 | 按抑制规则处理 | **弹窗**（不受未读数限制） |
+| 深夜 / 任意时段 | 不做时间抑制 | 不做时间抑制 |
+| 同一句「恭喜发财，大吉大利」连发 | 按未读变化判定 | 靠未读数增加识别，同文案也不漏 |
+
+提示音读取 `data/notify.wav`（源码运行读脚本同级 `data/`，打包后读 `_internal/data/`）。找不到文件时弹窗照常出现、仅静音，不报错。
 
 ---
 
 ## 工作原理
 
 ```
+  _FileWatcher（ReadDirectoryChangesW）
+        │  监听 db_storage\session、db_storage\message
+        ▼
+  事件去抖 0.3s → 跟进扫描 3 轮
+        │
+        ▼
   read_sessions() ── UIA 树解析 ──► XTableView(Name="会话") → ChatSessionCell
         │
         ▼
-  对比 chat-records.json 去重
+  _is_new_msg() 对比 chat-records.json 的未读数判定是否新消息
         │
-        ▼
-  _show_toast() ── tkinter Toplevel 弹窗
+        ├── 含 [微信红包] ──► _show_redpacket_toast() + 提示音
+        │
+        └── 普通消息 ──► 免打扰静默 → 未读校验 → _show_toast()
         │
         ▼
   用户点击 → 模拟快捷键激活微信
 ```
 
-**核心技术栈**：`uiautomation` + `pywin32` + `tkinter`
+**核心技术栈**：`uiautomation` + `pywin32` + `tkinter`（窗口与事件循环）+ `Pillow`（渲染）
 
-**UIA 解析策略**：通过 `XTableView(Name="会话")` 控件读取 `ChatSessionCell` 子元素，兼容 `mmui::MainWindow`（标准版）和 `Qt*QWindowIcon`（Qt 渲染版）。初次搜索未命中时自动触发深度重搜。
+**UIA 解析策略**：通过 `XTableView(Name="会话")` 控件读取 `ChatSessionCell` 子元素，兼容 `mmui::MainWindow`（标准版）和 `Qt*QWindowIcon`（Qt 渲染版）。首次深搜成功后缓存控件路径，后续走快路径；快路径异常先原地重试 1 次，仍失败才丢弃缓存重新深搜（一次深搜约 2 秒，成本是命中路径的 600 倍）。
+
+**扫描节拍**：
+
+| 常量 | 取值 | 作用 |
+|------|------|------|
+| `DEBOUNCE_SEC` | 0.3 | 事件合并窗口 |
+| `BURST_SCANS` / `BURST_GAP_MS` | 3 / 300 | 唤醒后跟进扫描，等微信把库变化渲染进 UIA 树 |
+| `FALLBACK_SCAN_SEC` | 120 | 无事件也强制扫一次，防漏 |
+| `IDLE_TICK_MS` | 100 | 空闲只查内存标志，不碰 UIA |
+| `NO_WECHAT_GAP_MS` | 2000 | 微信窗口不存在时的探测间隔 |
 
 ---
 
@@ -106,19 +149,25 @@ python wechat_notifier.py
 - 后台进程自动启动，开始监听微信消息
 - 关闭控制台窗口不影响后台监听
 
+**调试弹窗效果**：`python wechat_notifier.py --demo-toast` 直接弹出一个演示弹窗，不必等真实消息。
+
 ---
 
 ## 控制面板
 
 ```
   =====================================================
-             微信消息通知器 v0.2.4  控制台版
-                 
+          微信消息通知器  v0.2.7
+                 作者: 不理笨笨
   =====================================================
+   微信保持登录即可，可最小化，请勿退出微信
+   关闭本窗口不影响后台监听
 
-  [1] Alt+X    [2] Ctrl+Alt+W   [3] Alt+W   [4] 关闭快捷键
-  [5] 开机自启
-  [6] 彻底退出通知器
+   当前唤醒键: Ctrl+Alt+W
+   [1] Alt+X   [2] Ctrl+Alt+W   [3] Alt+W   [4] 关闭
+   [5] 开机自启: 已关闭
+   [6] 退出通知器
+  =====================================================
 ```
 
 | 选项 | 功能 |
@@ -130,26 +179,36 @@ python wechat_notifier.py
 
 ---
 
+## 数据文件
+
+所有运行时文件都在 `data/` 目录（不纳入版本控制）：
+
+| 文件 | 用途 |
+|------|------|
+| `settings.json` | 快捷键、开机自启、退出请求等配置 |
+| `chat-records.json` | 会话缓存，用于未读数对比判定新消息 |
+| `bg_pid.txt` | 后台进程 PID，用于单实例与残留清理 |
+| `debug.log` | 仅记录弹窗事件；超过 1MB 轮转为 `debug.log.1` |
+| `error.log` | 异常记录（时间、位置、traceback）；超过 512KB 轮转 |
+| `notify.wav` | 红包提示音（随仓库提供） |
+
+---
+
 ## 从源码构建 EXE
 
-如果你想打包成独立可执行文件（无需安装 Python）：
+推荐直接用仓库内的 spec 文件：
 
 ```bash
-pyinstaller --onedir --console \
-    --icon data\wechat_new.ico \
-    --exclude-module PIL._avif \
-    --exclude-module PIL._webp \
-    --exclude-module PIL._imagingcms \
-    --exclude-module win32ui \
-    --exclude-module lzma \
-    --name WeChatNotifier_v0.2.4 \
-    wechat_notifier.py
+python -m PyInstaller --noconfirm --clean WeChatNotifier_v0.2.7.spec
 ```
 
+产物位于 `dist\WeChatNotifier_v0.2.7\`。
+
 **打包注意事项**：
-- 必须使用 `--console` 子系统（程序依赖 `GetConsoleWindow()` 实现 CMD 隐身）
+- 必须使用 `--console` 子系统（程序依赖 `GetConsoleWindow()` 实现控制台隐身）
 - 推荐 `--onedir` 模式（免解压，启动更快）
-- 排除 5 个冗余模块可减少安装包约 9.4MB
+- spec 已声明打包 `data/notify.wav` 与 `data/wechat_new.ico`，缺图标或音频会静音或使用默认图标
+- spec 已排除 `PIL.ImageQt`、`PIL.ImageTk`、`PIL.ImageGrab`、`PIL._avif`、`PIL._webp`、`PIL.ImageSequence`、`PIL.PdfParser` 等冗余模块
 
 ---
 
@@ -159,9 +218,27 @@ pyinstaller --onedir --console \
 |------|------|
 | 微信不能缩到系统托盘 | Qt 框架在微信缩到托盘时会完全剪枝 UIA 子控件树（`GetChildren()` 返回 0），导致无法读取会话 |
 | 正常最小化不影响 | 最小化到任务栏（`IsIconic=1, IsWindowVisible=1`）时 UIA 树保持完整 |
-| COM RPC 偶尔僵死 | 极少数情况下 UIA COM 调用会陷入 60 秒阻塞，框架已内置自动重置机制 |
-| 仅支持 Windows | 依赖 COM / UIA / Win32 API |
+| COM RPC 偶尔僵死 | 极少数情况下 UIA COM 调用会陷入长阻塞，现以非阻塞退避 30 秒重置，退避期间事件仍被记录 |
+| 事件唤醒依赖 db 落盘 | 微信把消息写库后才触发唤醒，比纯轮询多一个落盘延迟；文字消息实测无明显差异 |
+| 仅支持 Windows | 依赖 COM / UIA / Win32 分层窗口 |
 | 仅测试微信 4.1.x | UI 结构随微信版本变化，新版可能需调整 UIA 解析逻辑 |
+| 红包识别依赖标签 | 若微信改掉 `[微信红包]` 类型标签，需同步调整 `_is_redpacket()` |
+
+---
+
+## 常见问题
+
+**Q：红包弹窗出现了但没有声音？**
+检查 `data/notify.wav` 是否存在。源码运行时需与脚本同级，打包后需在 `_internal/data/` 下。缺文件只静音，不报错。
+
+**Q：免打扰群里为什么普通消息不弹、红包却弹？**
+这是设计行为：普通通道遇到免打扰会话直接跳过，红包通道独立且不受免打扰限制。
+
+**Q：为什么 `data/debug.log` 没生成？**
+正式版 `DEBUG_LOG = False`，诊断日志不落盘；只有真实弹窗时才写一行记录。排查问题请看 `data/error.log`。
+
+**Q：关掉 CMD 窗口后还能收到通知吗？**
+可以。后台进程已通过 `FreeConsole()` 彻底脱离控制台，关闭窗口不会终止监听。
 
 ---
 
@@ -186,5 +263,5 @@ MIT License - 详见 [LICENSE](LICENSE)
 ## 致谢
 
 - [uiautomation](https://github.com/yinkaisheng/Python-UIAutomation-for-Windows) - Windows UIA Python 绑定
-- [pystray](https://github.com/moses-palmer/pystray) - 系统托盘支持
-- [Pillow](https://python-pillow.org/) - 图像处理
+- [Pillow](https://python-pillow.org/) - 弹窗底图与文字层渲染
+- [pywin32](https://github.com/mhammond/pywin32) - Win32 分层窗口与进程管理
