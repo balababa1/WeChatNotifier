@@ -1,5 +1,9 @@
 ﻿"""
 微信消息通知器 - CMD控制台版
+v0.2.9: rip_xrefs 去 numpy 化（字节级纯 Python 实现），无 numpy 环境也不再
+        多出一个距目标 59.9MB 的无关 gate 候选，候选集合与有 numpy 时一致
+v0.2.8: 新增 UIA gate 判定层（启动抓到 weixin.exe 先查 Qt 无障碍标志字节，
+        为 1 跳过修改、不为 1 才写入 1，再执行原有抓取流程）
 v0.2.7: 正式版（异常可见化 + 清理死常量 + 控制台面板精简 + 去诊断日志）
 作者: 不理笨笨
 """
@@ -21,7 +25,7 @@ LOG_FILE      = DATA_DIR / "debug.log"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 
 # ── 常量 ──
-VERSION      = "v0.2.7"
+VERSION      = "v0.2.9"
 BLACK_LIST   = {"服务号", "公众号", "文件传输助手", "折叠的聊天", "服务通知", "微信团队"}
 TIME_WORDS   = {"昨天", "今天", "上午", "下午", "刚刚"}
 
@@ -772,9 +776,23 @@ def _get_scale(root):
     """直接取 Windows 系统 DPI 缩放比，不再从屏幕尺寸推算"""
     try:
         import ctypes
-        hdc = ctypes.windll.user32.GetDC(0)
-        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
-        ctypes.windll.user32.ReleaseDC(0, hdc)
+        _u32 = ctypes.windll.user32
+        _g32 = ctypes.windll.gdi32
+        # 64 位下 HWND/HDC 必须显式声明为指针类型，
+        # 否则默认 c_int 会截断高位句柄 → OverflowError，且 ReleaseDC 永不执行造成 GDI 泄漏
+        _u32.GetDC.restype = ctypes.c_void_p
+        _u32.GetDC.argtypes = [ctypes.c_void_p]
+        _u32.ReleaseDC.restype = ctypes.c_int
+        _u32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _g32.GetDeviceCaps.restype = ctypes.c_int
+        _g32.GetDeviceCaps.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        hdc = _u32.GetDC(None)
+        if not hdc:
+            raise OSError("GetDC 返回空句柄")
+        try:
+            dpi = _g32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+        finally:
+            _u32.ReleaseDC(None, hdc)          # 异常路径也必须释放，杜绝 GDI 泄漏
         return max(0.5, min(2.0, dpi / 96.0))
     except Exception as e:
         _note_err("_get_scale", e)
@@ -1209,8 +1227,9 @@ def read_sessions(hwnd=0):
         try:
             for c in root.GetChildren():
                 cn = c.ClassName or ""
-                # 兼容两种微信窗口: mmui::MainWindow (标准版) / Qt*QWindowIcon (Qt 渲染版)
-                if cn == "mmui::MainWindow" or "QWindowIcon" in cn:
+                # 只认 mmui::MainWindow。Qt 渲染形态（主窗口表现为 Qt*QWindowIcon）下
+                # 微信不暴露 mmui 控件树，匹配到也找不到会话列表，故不再作为兼容分支。
+                if cn == "mmui::MainWindow":
                     mainwin = c
                     break
         except Exception as e:
@@ -1278,6 +1297,126 @@ def read_sessions(hwnd=0):
     except Exception as e:
         logd(f"[read_sessions] 未捕获异常: {e!r}")
         return None
+
+
+# ══════════════════════════════════════════════════════════════════
+#      UIA gate 判定层（v0.2.8 新增，方案来自 wechatauto-replica）
+# ══════════════════════════════════════════════════════════════════
+# 每次抓到 weixin.exe 时，先问一次 Weixin.dll 里 QAccessible 的 active byte：
+#   值 == 1  → 已激活，跳过修改，直接走原有抓取流程
+#   值 != 1  → 该字节写 1 并回读确认，再走原有抓取流程
+# 判定跑在后台线程（首次无缓存要扫 Weixin.dll 的 200MB），绝不占住 Tk 主循环；
+# 只改运行中进程的 1 个字节，微信重启后 PID 变化会重新判定一次。
+_uia_gate = {}            # pid -> {state, value, rva, dll, msg, ts, tree_ready, confirmed}
+_uia_gate_lock = threading.Lock()
+_UIA_GATE_RETRY = 3600.0  # 判定失败后同一 PID 的重试冷却（秒）
+_UIA_GATE_RETRYABLE = ("failed", "no_gate", "no_proc")
+
+
+def _wechat_pid_of(hwnd):
+    """窗口句柄 → 进程 PID（微信重启后 PID 变化，gate 判定按 PID 归档）。"""
+    try:
+        import ctypes.wintypes as wt
+        pid = wt.DWORD(0)
+        ctypes.windll.user32.GetWindowThreadProcessId(wt.HWND(hwnd), ctypes.byref(pid))
+        return int(pid.value) or 0
+    except Exception as e:
+        _note_err("_wechat_pid_of", e)
+        return 0
+
+
+def _kick_uia_gate(hwnd, tree_ready=False):
+    """非阻塞入口：同一微信 PID 只判定一次，失败项按冷却重试。"""
+    pid = _wechat_pid_of(hwnd)
+    if not pid:
+        return
+    spawn = False
+    with _uia_gate_lock:
+        rec = _uia_gate.get(pid)
+        if rec is None:
+            _uia_gate[pid] = {"state": "pending", "value": None, "rva": None,
+                              "dll": "", "msg": "", "ts": time.time(),
+                              "tree_ready": bool(tree_ready), "confirmed": False}
+            spawn = True
+        else:
+            if tree_ready:
+                rec["tree_ready"] = True
+            if rec.get("state") == "pending":
+                return
+            if (rec.get("state") in _UIA_GATE_RETRYABLE
+                    and time.time() - rec.get("ts", 0) > _UIA_GATE_RETRY):
+                rec.update({"state": "pending", "ts": time.time()})
+                spawn = True
+    if spawn:
+        threading.Thread(target=_uia_gate_worker, args=(pid,), daemon=True).start()
+
+
+def _uia_gate_tree_ready(pid):
+    with _uia_gate_lock:
+        rec = _uia_gate.get(pid) or {}
+        return bool(rec.get("tree_ready"))
+
+
+def _uia_gate_worker(pid):
+    """后台线程：读值 →（不为 1 时）写 1 → 回读确认。不碰 uiautomation。"""
+    try:
+        import wechat_uia
+    except Exception as e:
+        _note_err("_uia_gate_worker.import", e)
+        with _uia_gate_lock:
+            _uia_gate[pid] = {"state": "failed", "value": None, "rva": None, "dll": "",
+                              "msg": f"wechat_uia 模块不可用: {e!r}", "ts": time.time(),
+                              "tree_ready": False, "confirmed": False}
+        log(f"[UIA] gate 判定跳过：wechat_uia 模块不可用（{e!r}）")
+        return
+    try:
+        res = wechat_uia.check_and_activate(
+            pid,
+            logger=log,
+            tree_ready=_uia_gate_tree_ready(pid),
+            tree_ready_probe=lambda: _uia_gate_tree_ready(pid),
+        )
+    except Exception as e:
+        _note_err("_uia_gate_worker.run", e)
+        res = {"state": "failed", "value": None, "rva": None, "dll": "", "msg": repr(e)}
+
+    with _uia_gate_lock:
+        prev = _uia_gate.get(pid) or {}
+        res.update({"ts": time.time(),
+                    "tree_ready": bool(prev.get("tree_ready")),
+                    "confirmed": bool(prev.get("confirmed"))})
+        _uia_gate[pid] = res
+
+    state = res.get("state")
+    if state == "already":
+        log(f"[UIA] gate 值=1，跳过修改（{res.get('msg')}）")
+    elif state == "patched":
+        log(f"[UIA] gate 值={res.get('value')}，已写入 1（RVA 0x{res.get('rva') or 0:X}）")
+    elif state == "skipped":
+        log(f"[UIA] {res.get('msg')}")
+    else:
+        log(f"[UIA] gate 判定未生效：{res.get('msg')}")
+
+
+def _uia_gate_confirm(hwnd):
+    """主线程确实抓到会话后调用：把生效地址固化成首选候选（下次免扫描）。"""
+    pid = _wechat_pid_of(hwnd)
+    if not pid:
+        return
+    with _uia_gate_lock:
+        rec = _uia_gate.get(pid)
+        if not rec or rec.get("state") != "patched" or rec.get("confirmed"):
+            return
+        rec["confirmed"] = True
+        rva, dll = rec.get("rva"), rec.get("dll")
+    if not rva or not dll:
+        return
+    try:
+        import wechat_uia
+        wechat_uia.mark_verified(dll, rva)
+        log(f"[UIA] 控件树已可用，生效地址 0x{rva:X} 已固化到缓存")
+    except Exception as e:
+        _note_err("_uia_gate_confirm", e)
 
 
 def reset_uia(reason=""):
@@ -1499,6 +1638,39 @@ def run_background():
     records = {}
     # 写盘节流：保存"上次已落盘"的原始文本，内容未变则不再写盘
     _last_saved = [""]
+
+    # ── 落盘优化：紧凑序列化 + 延迟合并 + 原子替换 ──
+    # 判重与弹窗全程只读内存 records，落盘仅是给下次启动留基线快照，
+    # 因此可以把短时间内的多次变化合并成一次写，不影响任何弹窗时序。
+    REC_SAVE_MIN_GAP = 5.0      # 变化后延迟多少秒落盘（合并窗口）
+    _rec_pending = [None]       # 待落盘的序列化文本（None = 无待写）
+    _rec_timer = [None]         # 延迟写盘的 after id
+
+    def _flush_records(_=None):
+        """把待写快照原子落盘。写失败只记诊断，绝不影响判重与弹窗。"""
+        _rec_timer[0] = None
+        buf = _rec_pending[0]
+        if buf is None or buf == _last_saved[0]:
+            _rec_pending[0] = None
+            return
+        try:
+            tmp = RECORDS_FILE.with_name(RECORDS_FILE.name + ".tmp")
+            tmp.write_text(buf, encoding="utf-8")
+            os.replace(tmp, RECORDS_FILE)   # 原子替换：杜绝半截 JSON 导致的记录清空
+            _last_saved[0] = buf
+            _rec_pending[0] = None
+        except Exception as e:
+            _note_err("_flush_records", e)
+
+    def _mark_records_dirty(buf):
+        """记录新快照，并确保延迟窗口到期后必定落盘（不依赖下一轮轮询）。"""
+        _rec_pending[0] = buf
+        if _rec_timer[0] is None:
+            try:
+                _rec_timer[0] = root.after(int(REC_SAVE_MIN_GAP * 1000), _flush_records)
+            except Exception as e:
+                _note_err("_mark_records_dirty", e)
+
     if RECORDS_FILE.exists():
         try:
             _last_saved[0] = RECORDS_FILE.read_text(encoding="utf-8")
@@ -1579,6 +1751,10 @@ def run_background():
                 s.pop("exit_requested", None)
                 SETTINGS_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
                 logd("[退出] 收到 exit_requested，注销后台进程")
+                try:
+                    _flush_records()    # 退出前兜底落盘，避免丢最后几秒的判重基准
+                except Exception as e:
+                    _note_err("_check_exit.flush", e)
                 root.quit()
                 return
         except Exception as e:
@@ -1595,6 +1771,10 @@ def run_background():
             _burst_left[0] = 0
             root.after(NO_WECHAT_GAP_MS, _wait_next)   # 微信未运行: 低频探测，不空转
             return
+
+        # ── v0.2.8: 抓到 weixin.exe 就判定 gate（后台线程，非阻塞）──
+        # 值已是 1 则什么都不做；不为 1 才走修改流程。判定不影响本轮抓取节奏。
+        _kick_uia_gate(wechat_hwnd)
 
         # 本轮结束后的调度方式: normal(等下一次文件事件) / immediate(立即重扫) / backoff(COM 退避)
         next_action = "normal"
@@ -1630,6 +1810,10 @@ def run_background():
                 reset_cycle = 0
                 empty_count = 0
                 com_error_count = 0
+                # ── v0.2.8: 控件树可用 = 判定层已生效；告知 gate 线程免去无谓扫描，
+                # 并把「确实生效的地址」固化进缓存，下次启动零扫描 ──
+                _kick_uia_gate(wechat_hwnd, tree_ready=True)
+                _uia_gate_confirm(wechat_hwnd)
                 for s in sessions:
                     user = s["user"]
                     msg = s["msg"]
@@ -1672,11 +1856,11 @@ def run_background():
                         log(f"弹窗: {title} -> {body}")
                     except Exception as e:
                         logd(f"[弹窗] 普通弹窗失败: {e!r}")
-                # 写盘节流：仅当内容与上次落盘不同才写，静止时不再每轮写盘
-                _buf = json.dumps(records, ensure_ascii=False, indent=2)
+                # 写盘节流：内容与上次落盘相同则跳过；有变化只打脏标记，
+                # 由 _flush_records 合并写盘（紧凑格式，体积约为 indent=2 的一半）
+                _buf = json.dumps(records, ensure_ascii=False, separators=(",", ":"))
                 if _buf != _last_saved[0]:
-                    _last_saved[0] = _buf
-                    RECORDS_FILE.write_text(_buf, encoding="utf-8")
+                    _mark_records_dirty(_buf)
         except Exception as e:
             logd(f"[_poll] 未捕获异常: {e!r}")
 
@@ -1693,6 +1877,11 @@ def run_background():
         ctypes.windll.user32.ShowWindow(hwnd_console, 0)
 
     root.mainloop()
+
+    try:
+        _flush_records()            # 进程收尾兜底落盘
+    except Exception as e:
+        _note_err("run_background.final_flush", e)
 
     for _w in _watchers:
         try:
@@ -1957,6 +2146,42 @@ def run_demo_toast():
     root.mainloop()
 
 
+def run_gate_status():
+    """诊断入口（--gate-status）：只读打印 gate 判定结果，一个字节都不写。"""
+    _enable_dpi_awareness()
+    hwnd = _wechat_window_handle()
+    if not hwnd:
+        print("  微信未运行：找不到 weixin.exe 主窗口")
+        return 2
+    pid = _wechat_pid_of(hwnd)
+    print("  通知器版本    : %s" % VERSION)
+    print("  微信 PID      : %d" % pid)
+    try:
+        import wechat_uia as U
+    except Exception as e:
+        print("  wechat_uia 模块不可用: %r" % e)
+        return 3
+    mod = U.weixin_dll(pid)
+    if not mod:
+        print("  读不到 Weixin.dll 模块基址（权限不足？不要用管理员身份运行）")
+        return 4
+    print("  Weixin.dll    : %s" % mod[1])
+    print("  模块基址      : 0x%X" % mod[0])
+    print("  ---- 以下为只读判定，不修改任何字节 ----")
+    res = U.check_and_activate(pid, logger=lambda m: print("  " + m), dry_run=True)
+    print("  判定状态      : %s" % res.get("state"))
+    print("  gate 当前值   : %s" % res.get("value"))
+    print("  命中 RVA      : %s" % (("0x%X" % res["rva"]) if res.get("rva") else "—"))
+    print("  结论          : %s" % res.get("msg"))
+    if res.get("state") == U.ST_ALREADY:
+        print("  -> 值为 1：通知器启动时会跳过修改，直接走原有抓取流程")
+    elif res.get("state") == U.ST_READONLY:
+        print("  -> 值不为 1：通知器启动时会先把该字节写成 1，再走原有抓取流程")
+    else:
+        print("  -> 判定未生效，通知器会照常抓取，只是拿不到这层保险")
+    return 0
+
+
 def main():
     if "--background" in sys.argv:
         run_background()
@@ -1965,6 +2190,9 @@ def main():
     if "--demo-toast" in sys.argv:
         run_demo_toast()
         return
+
+    if "--gate-status" in sys.argv:
+        sys.exit(run_gate_status())
 
     if getattr(sys, "frozen", False):
         kernel32 = ctypes.windll.kernel32
