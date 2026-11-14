@@ -1227,8 +1227,11 @@ def read_sessions(hwnd=0):
         try:
             for c in root.GetChildren():
                 cn = c.ClassName or ""
-                # 只认 mmui::MainWindow。Qt 渲染形态（主窗口表现为 Qt*QWindowIcon）下
-                # 微信不暴露 mmui 控件树，匹配到也找不到会话列表，故不再作为兼容分支。
+                # 只认 mmui::MainWindow。微信 4.x 的顶层窗口有两套类名且必须分开看:
+                #   Win32 层 = Qt51514QWindowIcon（顶层窗口由 Qt 承载）、标题 = 当前聊天对象名（动态变化）
+                #   UIA  层 = mmui::MainWindow（控件树由 mmui 框架提供，完整可枚举）
+                # 两者共存，不构成"Qt 渲染所以读不到控件"的关系，故不能用 Win32 类名做匹配，
+                # 也不再保留 "QWindowIcon" in cn 的兼容分支。
                 if cn == "mmui::MainWindow":
                     mainwin = c
                     break
@@ -1252,13 +1255,15 @@ def read_sessions(hwnd=0):
             logd("[窗口] 主窗口句柄已失效")
             return None
 
-        # ── Qt 渲染版本兼容: mainwin 只包含 MMUIRenderSubWindowHW 时钻入它 ──
-        try:
-            mw_children = list(mainwin.GetChildren())
-            if len(mw_children) == 1 and "MMUIRenderSubWindowHW" in (mw_children[0].ClassName or ""):
-                mainwin = mw_children[0]
-        except Exception as e:
-            logd(f"[窗口] 探测渲染子窗口异常(不影响主流程): {e!r}")
+        # ── 注意: 不要钻入 MMUIRenderSubWindowHW ──
+        # 4.2.0.13 实测控件树归属:
+        #   主窗口 mmui::MainWindow 下 2 个子元素
+        #     ├─ MMUIRenderSubWindowHW (PaneControl)  直接子级数 = 0，空壳
+        #     └─ QWidget               (GroupControl) 3 个子级，会话表在这条分支下
+        #   会话表父链: XTableView ← ChatSessionList ← ... ← QWidget ← ... ← MainWindow（共 14 层）
+        # 从 MMUIRenderSubWindowHW 起搜 depth=20 必然搜不到（1.0s 超时返回空）。
+        # 旧代码在"只有 1 个子元素且类名含 MMUIRenderSubWindowHW"时钻入该空壳，
+        # 结果只会直接搜不到会话列表，属确定性错误分支，已删除。
 
         # ── 定位会话列表: 实测真实深度 14 层，searchDepth=20 一次到位 ──
         #    (原 searchDepth=30 的重搜段为冗余：20 能命中的场景 30 不会多命中，
