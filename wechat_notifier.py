@@ -25,7 +25,7 @@ LOG_FILE      = DATA_DIR / "debug.log"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 
 # ── 常量 ──
-VERSION      = "v0.2.9"
+VERSION      = "v0.2.10"
 BLACK_LIST   = {"服务号", "公众号", "文件传输助手", "折叠的聊天", "服务通知", "微信团队"}
 TIME_WORDS   = {"昨天", "今天", "上午", "下午", "刚刚"}
 
@@ -988,9 +988,12 @@ _wechat_hwnd_cache = [0]
 def _wechat_window_handle():
     """快速嗅探微信主窗口 HWND（命中缓存 ~0ms，无需 COM），返回 0 表示未找到。
 
-    注意: 微信 4.x 主窗口在 Win32 层的类名是 Qt5xxxxQWindowIcon、标题是当前聊天
-    对象名（动态变化），与 UIA 层的 mmui::MainWindow / Weixin 并不一致，
-    因此不能用 FindWindowW 按类名或标题定位，改为按进程名 Weixin.exe 枚举顶层窗口。
+    注意: 微信 4.x 的 Win32 层类名是 Qt5xxxxQWindowIcon、标题是当前聊天对象名（动态变化），
+    与 UIA 层的 mmui::MainWindow / Weixin 并不一致，因此**不能**用标题匹配定位:
+    4.2.x 进程里同时存在多个标题都为 "Weixin" 的隐藏辅助窗口（如 Qt51514QWindowToolSaveBits
+    394x70），按标题命中的正是它们，ControlFromHandle 之后拿到的是子级为 0 的 QLabel，
+    表现为"静默读不到会话"。现改为按进程名枚举全部顶层窗口后**按特征打分取最高分**，
+    辅助窗口 / 托盘消息窗口 / 输入法窗口直接剔除（见 issue #1）。
     """
     u = ctypes.windll.user32
 
@@ -1004,42 +1007,81 @@ def _wechat_window_handle():
     _wechat_hwnd_cache[0] = 0
 
     try:
-        # 1) 旧版微信: 标题精确匹配
-        for title in ("Weixin", "微信"):
-            hh = u.FindWindowW(None, title)
-            if hh:
-                _wechat_hwnd_cache[0] = hh
-                return hh
-
-        # 2) 新版微信: 按进程名 Weixin.exe / WeChat.exe 枚举顶层窗口
         import ctypes.wintypes as wt
         k = ctypes.windll.kernel32
         found = []
         WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
+        # 这些窗口的标题同样是 "Weixin"，必须靠类名剔除
+        _BAD_CLS = ("ToolSaveBits", "TrayIcon", "SystemMessage",
+                    "PowerMessage", "IME", "MSCTF")
+
+        def _cls_of(hwnd):
+            b = ctypes.create_unicode_buffer(256)
+            u.GetClassNameW(hwnd, b, 256)
+            return b.value or ""
+
         def _cb(hwnd, _lparam):
             pid = wt.DWORD(0)
             u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value:
-                hp = k.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED_INFORMATION
-                if hp:
-                    try:
-                        buf = ctypes.create_unicode_buffer(1024)
-                        size = wt.DWORD(1024)
-                        if k.QueryFullProcessImageNameW(hp, 0, buf, ctypes.byref(size)):
-                            n = buf.value.lower()
-                            if n.endswith("\\weixin.exe") or n.endswith("\\wechat.exe"):
-                                found.append(hwnd)
-                    except Exception as e:
-                        _note_err("_wechat_window_handle.enum", e)
-                    finally:
-                        k.CloseHandle(hp)
+            if not pid.value:
+                return True
+            hp = k.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED_INFORMATION
+            if not hp:
+                return True
+            try:
+                buf = ctypes.create_unicode_buffer(1024)
+                size = wt.DWORD(1024)
+                if not k.QueryFullProcessImageNameW(hp, 0, buf, ctypes.byref(size)):
+                    return True
+                n = buf.value.lower()
+                if not (n.endswith("\\weixin.exe") or n.endswith("\\wechat.exe")):
+                    return True
+            except Exception as e:
+                _note_err("_wechat_window_handle.enum", e)
+                return True
+            finally:
+                k.CloseHandle(hp)
+
+            cls = _cls_of(hwnd)
+            if cls and any(x in cls for x in _BAD_CLS):
+                return True          # 辅助 / 消息 / 输入法窗口，直接排除
+
+            score = 0
+            if cls:
+                if cls.endswith("QWindowIcon"):
+                    score += 100     # 微信 4.x 主窗口
+                if cls.startswith("Qt"):
+                    score += 20
+            if u.IsWindowVisible(hwnd):
+                score += 50
+            if not u.IsIconic(hwnd):
+                score += 30
+            # 尺寸只加分、绝不作过滤条件: 主窗口最小化到任务栏时 rect 会缩成 160x28 且 IsIconic=True
+            r = wt.RECT()
+            if u.GetWindowRect(hwnd, ctypes.byref(r)):
+                if (r.right - r.left) >= 300 and (r.bottom - r.top) >= 300:
+                    score += 20
+            tl = ctypes.create_unicode_buffer(256)
+            u.GetWindowTextW(hwnd, tl, 256)
+            if tl.value in ("Weixin", "微信"):
+                score += 10
+            found.append((score, hwnd))
             return True
 
         u.EnumWindows(WNDENUMPROC(_cb), 0)
         if found:
-            _wechat_hwnd_cache[0] = found[0]
-            return found[0]
+            found.sort(key=lambda x: x[0], reverse=True)
+            best = found[0][1]
+            _wechat_hwnd_cache[0] = best
+            return best
+
+        # 兜底: 旧版微信(3.x)只有一个标题为 Weixin / 微信 的主窗口，此时标题匹配才安全
+        for title in ("Weixin", "微信"):
+            hh = u.FindWindowW(None, title)
+            if hh:
+                _wechat_hwnd_cache[0] = hh
+                return hh
     except Exception as e:
         _note_err("_wechat_window_handle", e)
     return 0
@@ -1176,6 +1218,36 @@ def _is_new_msg(prev, msg, cur_u):
 # 只缓存控件对象本身；GetChildren 返回的会话项每轮都重新读取（内容会变）。
 # 缓存失效（Exists 返回 False / 抛异常）自动回退到完整深搜，且失败轮不更新去重记录，
 # 因此不会漏消息，只会延迟 1-2 秒。
+# ── 空结果诊断（issue #1 补充建议）──
+# 原实现读不到会话时完全静默（error.log 为空），用户无法自查。
+# 现按"连续 N 轮"限频落盘: 正常轮次零日志，只有持续失败才写一次，不会刷屏。
+_EMPTY_STREAK = [0]
+_EMPTY_WARN_AT = 5
+
+
+def _note_empty(reason):
+    """连续 _EMPTY_WARN_AT 轮读不到会话时，把原因写进 error.log（限频）。"""
+    _EMPTY_STREAK[0] += 1
+    n = _EMPTY_STREAK[0]
+    if n == _EMPTY_WARN_AT or (n > _EMPTY_WARN_AT and n % (20 * _EMPTY_WARN_AT) == 0):
+        _note_err("read_sessions 连续 %d 轮读不到会话: %s" % (n, reason))
+
+
+def _clear_empty():
+    _EMPTY_STREAK[0] = 0
+
+
+def _enum_session_cells(table):
+    """枚举会话表下的 mmui::ChatSessionCell 并逐项解析，返回解析成功的会话列表。"""
+    out = []
+    for c in table.GetChildren():
+        if c.ControlTypeName == "ListItemControl" and c.ClassName == "mmui::ChatSessionCell":
+            p = parse_session(c.Name)
+            if p:
+                out.append(p)
+    return out
+
+
 _cached_table = None
 _last_cache_hit = False    # 上一轮 read_sessions 是否走了缓存快路径（仅用于日志观测）
 
@@ -1194,14 +1266,10 @@ def read_sessions(hwnd=0):
         for _attempt in (1, 2):
             try:
                 if _cached_table.Exists(0):
-                    _sessions = []
-                    for _c in _cached_table.GetChildren():
-                        if _c.ControlTypeName == "ListItemControl" and _c.ClassName == "mmui::ChatSessionCell":
-                            _p = parse_session(_c.Name)
-                            if _p:
-                                _sessions.append(_p)
+                    _sessions = _enum_session_cells(_cached_table)
                     if _sessions:
                         _last_cache_hit = True
+                        _clear_empty()
                         return _sessions
                 break              # Exists 为 False: UI 已重建，重试无意义，直接落完整流程
             except Exception as e:
@@ -1211,6 +1279,32 @@ def read_sessions(hwnd=0):
                     break
                 logd(f"[缓存] 快路径异常，重试 1 次: {e!r}")
                 time.sleep(0.02)
+
+    # ── HWND 直连快路径（issue #1 核心修复）──
+    # 调用方已用 _wechat_window_handle() 精确定位主窗口，直接 ControlFromHandle 即可，
+    # 不必从桌面根控件枚举。原流程优先 root.GetChildren(): 它会逐个唤醒所有顶层窗口的
+    # UIA provider，只要其中一个无响应就整轮阻塞（实测 60s 不返回且**不抛异常**），
+    # 于是下面 except 里"改走 HWND 直连"的兜底永远不可达。故把 HWND 直连提到最前，
+    # root.GetChildren() 降级为最后兜底。
+    if hwnd:
+        try:
+            _mw = auto.ControlFromHandle(hwnd)
+            _mcls = (_mw.ClassName or "") if _mw is not None else ""
+            if _mcls == "mmui::MainWindow":
+                _t = _mw.Control(searchDepth=20, Name="会话", ClassName="mmui::XTableView")
+                if _t is not None and _t.Exists(0):
+                    _ss = _enum_session_cells(_t)
+                    if _ss:
+                        _cached_table = _t
+                        _clear_empty()
+                        return _ss
+                    _note_empty("直连会话表存在但无会话项")
+                else:
+                    _note_empty("直连未找到会话表 mmui::XTableView")
+            else:
+                _note_empty("HWND 直连类名不是 mmui::MainWindow: %r" % (_mcls,))
+        except Exception as e:
+            logd(f"[HWND] 快路径失败，回落原流程: {e!r}")
 
     try:
         # ── COM 健康检查: Exists(0) ~0ms 试探连通性，断连直接 None ──
@@ -1249,10 +1343,12 @@ def read_sessions(hwnd=0):
 
         if not mainwin:
             logd("[窗口] 未找到微信主窗口")
+            _note_empty("根控件下未找到 mmui::MainWindow")
             return None
 
         if not mainwin.Exists(0):
             logd("[窗口] 主窗口句柄已失效")
+            _note_empty("主窗口句柄已失效")
             return None
 
         # ── 注意: 不要钻入 MMUIRenderSubWindowHW ──
@@ -1281,6 +1377,7 @@ def read_sessions(hwnd=0):
                 table = None
         if table is None or not table.Exists(0):
             logd("[定位] 未找到会话列表控件")
+            _note_empty("主窗口下未找到会话列表控件")
             return []
 
         _cached_table = table          # 缓存控件对象，供后续轮次走快路径
@@ -1297,6 +1394,10 @@ def read_sessions(hwnd=0):
                 p = parse_session(c.Name)
                 if p:
                     sessions.append(p)
+        if sessions:
+            _clear_empty()
+        else:
+            _note_empty("会话表枚举结果为空")
         return sessions
 
     except Exception as e:
@@ -1599,8 +1700,20 @@ def run_background():
         ctypes.windll.user32.ShowWindow(hwnd_console, 0)
         kernel32.FreeConsole()
 
-    h_mutex = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    # ── 单实例保护（issue #1 问题③）──
+    # CreateMutexW 的语义是: 不论互斥体是新建还是已存在，只要调用成功就返回**有效句柄**，
+    # 所以原实现只判返回值是否为空，这个分支永远不会命中 —— 单实例保护实际等于没有，
+    # 重复启动会出现多个 --background 进程同时弹同一批消息、并互相覆盖 bg_pid.txt。
+    # 正确做法是查 GetLastError() == ERROR_ALREADY_EXISTS(183)。
+    # 另: ctypes.windll.kernel32 的 CreateMutexW 默认 restype=c_int，64 位下句柄会被截断，
+    #     且只有 WinDLL(..., use_last_error=True) 才能可靠读到 last error。
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32.CreateMutexW.restype = ctypes.c_void_p
+    _k32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+    h_mutex = _k32.CreateMutexW(None, False, MUTEX_NAME)
     if not h_mutex:
+        return
+    if ctypes.get_last_error() == 183:      # ERROR_ALREADY_EXISTS: 已有实例在跑，静默退出
         return
 
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
