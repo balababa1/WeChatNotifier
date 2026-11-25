@@ -166,7 +166,7 @@ python wechat_notifier.py
 
 ```
   =====================================================
-          微信消息通知器  v0.2.9
+          微信消息通知器  v0.2.10
                  作者: 不理笨笨
   =====================================================
    微信保持登录即可，可最小化，请勿退出微信
@@ -208,10 +208,10 @@ python wechat_notifier.py
 推荐直接用仓库内的 spec 文件：
 
 ```bash
-python -m PyInstaller --noconfirm --clean WeChatNotifier_v0.2.9.spec
+python -m PyInstaller --noconfirm --clean WeChatNotifier_v0.2.10.spec
 ```
 
-产物位于 `dist\WeChatNotifier_v0.2.9\`。
+产物位于 `dist\WeChatNotifier_v0.2.10\`。
 
 **打包注意事项**：
 - 必须使用 `--console` 子系统（程序依赖 `GetConsoleWindow()` 实现控制台隐身）
